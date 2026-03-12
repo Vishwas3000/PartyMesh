@@ -45,22 +45,48 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
     private let serviceType = "u1-mesh"
     private let myPeerID = MCPeerID(displayName: UIDevice.current.name)
 
+    /// Stable UUID broadcast in discoveryInfo so each peer can decide who invites whom.
+    /// The device with the lexicographically higher UUID sends the invitation;
+    /// the other waits to receive one. This prevents the double-invite race condition
+    /// that causes immediate disconnect loops.
+    private let sessionUUID = UUID().uuidString
+
     private var advertiser: MCNearbyServiceAdvertiser?
     private var browser: MCNearbyServiceBrowser?
     private var session: MCSession!
 
+    /// Peers we've invited but that haven't reached .connected yet.
+    private var pendingPeers: Set<MCPeerID> = []
+
     var niSession: NISession?
-    var peerTokens: [MCPeerID: NIDiscoveryToken] = [:] // Map peerID to their discovery token
-    var connectedPeers: [MCPeerID: NINearbyObject] = [:] // Map peerID to their last known nearby object
+    var peerTokens: [MCPeerID: NIDiscoveryToken] = [:]
+    var connectedPeers: [MCPeerID: NINearbyObject] = [:]
 
     override init() {
         super.init()
+        buildSession()
+    }
+
+    // MARK: - Session lifecycle
+
+    private func buildSession() {
         session = MCSession(peer: myPeerID, securityIdentity: nil, encryptionPreference: .required)
         session.delegate = self
     }
 
+    /// Tear down and recreate MCSession so the next foundPeer connects cleanly.
+    /// Called whenever the last peer disconnects.
+    private func rebuildSession() {
+        session.disconnect()
+        buildSession()
+        pendingPeers.removeAll()
+        print("[MeshManager] 🔄 Session rebuilt — ready for fresh connections")
+    }
+
     func start() {
-        advertiser = MCNearbyServiceAdvertiser(peer: myPeerID, discoveryInfo: nil, serviceType: serviceType)
+        advertiser = MCNearbyServiceAdvertiser(peer: myPeerID,
+                                               discoveryInfo: ["sid": sessionUUID],
+                                               serviceType: serviceType)
         advertiser?.delegate = self
         advertiser?.startAdvertisingPeer()
 
@@ -70,98 +96,153 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
 
         niSession = NISession()
         niSession?.delegate = self
-        delegate?.meshManager(self, didUpdateState: "Advertising and browsing started. NearbyInteraction session initialized.")
+
+        // Restart discovery every time the app comes back to the foreground.
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidBecomeActive),
+                                               name: UIApplication.didBecomeActiveNotification, object: nil)
+
+        delegate?.meshManager(self, didUpdateState: "Searching for peers…")
     }
 
     func stop() {
+        NotificationCenter.default.removeObserver(self, name: UIApplication.didBecomeActiveNotification, object: nil)
         advertiser?.stopAdvertisingPeer()
         browser?.stopBrowsingForPeers()
         session.disconnect()
         niSession?.invalidate()
-        niSession = nil // Clear the session
+        niSession = nil
+        pendingPeers.removeAll()
         delegate?.meshManager(self, didUpdateState: "Stopped.")
+    }
+
+    @objc private func appDidBecomeActive() {
+        // Stop-then-start forces a fresh Bonjour registration — fixes stale
+        // service records left behind when the app was backgrounded.
+        advertiser?.stopAdvertisingPeer()
+        browser?.stopBrowsingForPeers()
+        advertiser?.startAdvertisingPeer()
+        browser?.startBrowsingForPeers()
+        print("[MeshManager] 🟢 App active — restarted discovery")
     }
 
     // MARK: - MCNearbyServiceAdvertiserDelegate
 
-    func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer peerID: MCPeerID, withContext context: Data?, invitationHandler: @escaping (Bool, MCSession?) -> Void) {
-        delegate?.meshManager(self, didUpdateState: "Received invitation from \(peerID.displayName)")
-        invitationHandler(true, session)
+    func advertiser(_ advertiser: MCNearbyServiceAdvertiser,
+                    didReceiveInvitationFromPeer peerID: MCPeerID,
+                    withContext context: Data?,
+                    invitationHandler: @escaping (Bool, MCSession?) -> Void) {
+        // Reject if already connected to avoid duplicate sessions.
+        let alreadyConnected = session.connectedPeers.contains(peerID)
+        print("[MeshManager] 📨 Invitation from \(peerID.displayName) — \(alreadyConnected ? "rejected (already connected)" : "accepted")")
+        invitationHandler(!alreadyConnected, alreadyConnected ? nil : session)
     }
 
     func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {
+        print("[MeshManager] ⚠️ Advertiser failed: \(error.localizedDescription) — retrying in 3s")
         delegate?.meshManager(self, didEncounterError: error)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.advertiser?.startAdvertisingPeer()
+        }
     }
 
     // MARK: - MCNearbyServiceBrowserDelegate
 
-    func browser(_ browser: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID, withDiscoveryInfo info: [String : String]?) {
-        delegate?.meshManager(self, didUpdateState: "Found peer: \(peerID.displayName). Inviting...")
-        browser.invitePeer(peerID, to: session, withContext: nil, timeout: 30)
+    func browser(_ browser: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID,
+                 withDiscoveryInfo info: [String: String]?) {
+        guard !session.connectedPeers.contains(peerID),
+              !pendingPeers.contains(peerID) else {
+            print("[MeshManager] ↩️ Skipping \(peerID.displayName) — already connected or pending")
+            return
+        }
+
+        // UUID tiebreaker: only the device with the higher sessionUUID sends the
+        // invitation. The lower-UUID device waits to receive one from the other side.
+        // This guarantees exactly one connection attempt regardless of timing,
+        // eliminating the double-invite → immediate-disconnect loop.
+        if let peerSID = info?["sid"] {
+            guard sessionUUID > peerSID else {
+                print("[MeshManager] ↩️ Lower UUID — waiting for \(peerID.displayName) to invite us")
+                return
+            }
+        }
+
+        pendingPeers.insert(peerID)
+        print("[MeshManager] 🔍 Found \(peerID.displayName) — inviting… (our UUID wins)")
+        browser.invitePeer(peerID, to: session, withContext: nil, timeout: 10)
     }
 
     func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
-        delegate?.meshManager(self, didUpdateState: "Lost peer: \(peerID.displayName)")
-        delegate?.meshManager(self, disconnectedPeer: peerID)
-        
-        peerTokens.removeValue(forKey: peerID)
-        connectedPeers.removeValue(forKey: peerID)
-        
-        // Check if there are still connected peers to maintain NI sessions for
-        if !session.connectedPeers.isEmpty {
-            // Re-run configurations for remaining connected peers if NISession was invalidated
-            if niSession == nil {
-                niSession = NISession()
-                niSession?.delegate = self
-            }
-            for (connectedPeerID, token) in peerTokens where session.connectedPeers.contains(connectedPeerID) {
-                let config = NINearbyPeerConfiguration(peerToken: token)
-                niSession?.run(config)
-            }
-        } else {
-            // If no more connected peers, invalidate and nil out NISession
-            niSession?.invalidate()
-            niSession = nil
-        }
+        // Only remove from pending; actual cleanup happens in session state .notConnected.
+        pendingPeers.remove(peerID)
+        print("[MeshManager] 🔍 Lost sight of \(peerID.displayName)")
     }
 
     func browser(_ browser: MCNearbyServiceBrowser, didNotStartBrowsingForPeers error: Error) {
+        print("[MeshManager] ⚠️ Browser failed: \(error.localizedDescription) — retrying in 3s")
         delegate?.meshManager(self, didEncounterError: error)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.browser?.startBrowsingForPeers()
+        }
     }
 
     // MARK: - MCSessionDelegate
 
     func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
+        // After rebuildSession(), the old MCSession still holds a delegate reference
+        // and can fire stale callbacks. Ignore any event that isn't from the
+        // current live session to prevent cascading rebuilds.
+        guard session === self.session else {
+            print("[MeshManager] ↩️ Ignoring state change from replaced session — \(peerID.displayName) \(state.rawValue)")
+            return
+        }
+
         switch state {
         case .connected:
+            pendingPeers.remove(peerID)
+            print("[MeshManager] ✅ Connected: \(peerID.displayName)")
             delegate?.meshManager(self, connectedPeer: peerID)
             delegate?.meshManager(self, didUpdateState: "Connected to \(peerID.displayName)")
             sendMyToken(to: peerID)
+
         case .connecting:
-            delegate?.meshManager(self, didUpdateState: "Connecting to \(peerID.displayName)")
+            print("[MeshManager] ⏳ Connecting: \(peerID.displayName)…")
+            delegate?.meshManager(self, didUpdateState: "Connecting to \(peerID.displayName)…")
+
         case .notConnected:
-            delegate?.meshManager(self, disconnectedPeer: peerID)
-            delegate?.meshManager(self, didUpdateState: "Disconnected from \(peerID.displayName)")
-            
+            pendingPeers.remove(peerID)
             peerTokens.removeValue(forKey: peerID)
             connectedPeers.removeValue(forKey: peerID)
-            
-            // Check if there are still connected peers to maintain NI sessions for
-            if !session.connectedPeers.isEmpty {
-                // If NISession was previously invalidated, reinitialize and run configs for active peers
-                if niSession == nil {
-                    niSession = NISession()
-                    niSession?.delegate = self
-                }
-                for (connectedPeerID, token) in peerTokens where session.connectedPeers.contains(connectedPeerID) {
-                    let config = NINearbyPeerConfiguration(peerToken: token)
-                    niSession?.run(config)
+            print("[MeshManager] ❌ Disconnected: \(peerID.displayName)  remaining=\(session.connectedPeers.count)")
+
+            delegate?.meshManager(self, disconnectedPeer: peerID)
+            delegate?.meshManager(self, didUpdateState: "Disconnected from \(peerID.displayName)")
+
+            if session.connectedPeers.isEmpty {
+                // Rebuild MCSession so the next peer gets a clean slate.
+                rebuildSession()
+                // Recreate NISession immediately so its token is ready before
+                // the next peer connects. NISession must be touched on main thread.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.niSession?.invalidate()
+                    self.niSession = NISession()
+                    self.niSession?.delegate = self
+                    print("[MeshManager] 🔄 NISession recreated — token ready: \(self.niSession?.discoveryToken != nil)")
                 }
             } else {
-                // If no more connected peers, invalidate and nil out NISession
-                niSession?.invalidate()
-                niSession = nil
+                // Refresh NI for remaining peers (also on main thread).
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    if self.niSession == nil {
+                        self.niSession = NISession()
+                        self.niSession?.delegate = self
+                    }
+                    for (pid, token) in self.peerTokens where self.session.connectedPeers.contains(pid) {
+                        self.niSession?.run(NINearbyPeerConfiguration(peerToken: token))
+                    }
+                }
             }
+
         @unknown default:
             fatalError("Unhandled MCSessionState")
         }
@@ -194,14 +275,18 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
         do {
             if let token = try NSKeyedUnarchiver.unarchivedObject(ofClass: NIDiscoveryToken.self, from: data) {
                 peerTokens[peerID] = token
-                delegate?.meshManager(self, didUpdateState: "Received token from \(peerID.displayName). Starting Nearby Interaction.")
-
-                guard let niSession = self.niSession else {
-                    delegate?.meshManager(self, didUpdateState: "NISession is nil, cannot run configuration for \(peerID.displayName)")
-                    return
+                print("[MeshManager] 🤝 Received NI token from \(peerID.displayName) — starting NI session")
+                delegate?.meshManager(self, didUpdateState: "Received NI token from \(peerID.displayName)")
+                // NISession.run must be called on the main thread.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    guard let niSession = self.niSession else {
+                        print("[MeshManager] ❌ niSession is nil when token arrived from \(peerID.displayName)")
+                        self.delegate?.meshManager(self, didUpdateState: "⚠️ NI session nil for \(peerID.displayName)")
+                        return
+                    }
+                    niSession.run(NINearbyPeerConfiguration(peerToken: token))
                 }
-                let config = NINearbyPeerConfiguration(peerToken: token)
-                niSession.run(config)
             }
         } catch {
             delegate?.meshManager(self, didEncounterError: error)
@@ -245,18 +330,35 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
 
     // MARK: - NearbyInteraction
 
-    private func sendMyToken(to peerID: MCPeerID) {
-        guard let myDiscoveryToken = niSession?.discoveryToken else {
-            delegate?.meshManager(self, didUpdateState: "NISession discovery token not available yet.")
-            return
-        }
+    /// Sends our NIDiscoveryToken to `peerID`.
+    /// Retries on main thread because:
+    ///   1. MCSession delegate fires on a background queue.
+    ///   2. NISession.discoveryToken needs one run-loop tick after NISession() init.
+    private func sendMyToken(to peerID: MCPeerID, attempt: Int = 0) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
 
-        do {
-            let data = try NSKeyedArchiver.archivedData(withRootObject: myDiscoveryToken, requiringSecureCoding: true)
-            try session.send(data, toPeers: [peerID], with: .reliable)
-            delegate?.meshManager(self, didUpdateState: "Sent token to \(peerID.displayName)")
-        } catch {
-            delegate?.meshManager(self, didEncounterError: error)
+            guard let token = self.niSession?.discoveryToken else {
+                if attempt < 5 {
+                    print("[MeshManager] ⏳ Token not ready for \(peerID.displayName), retry \(attempt + 1)/5")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        self?.sendMyToken(to: peerID, attempt: attempt + 1)
+                    }
+                } else {
+                    print("[MeshManager] ❌ Token still nil after 5 attempts for \(peerID.displayName)")
+                    self.delegate?.meshManager(self, didUpdateState: "⚠️ NI token unavailable for \(peerID.displayName)")
+                }
+                return
+            }
+
+            do {
+                let data = try NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
+                try self.session.send(data, toPeers: [peerID], with: .reliable)
+                print("[MeshManager] 📤 NI token sent to \(peerID.displayName) on attempt \(attempt + 1)")
+                self.delegate?.meshManager(self, didUpdateState: "Sent NI token to \(peerID.displayName)")
+            } catch {
+                self.delegate?.meshManager(self, didEncounterError: error)
+            }
         }
     }
 

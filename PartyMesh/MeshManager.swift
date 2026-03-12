@@ -6,10 +6,27 @@ import UIKit // Required for UIDevice
 // Sent over MultipeerConnectivity whenever a device is tapped.
 // x/y are normalised (0–1) screen coords; wallTime is Unix timestamp of the tap.
 struct RippleMessage: Codable {
+    let messageType: String  // always "ripple"
     let x: Float
     let y: Float
     let wallTime: Double   // Date().timeIntervalSince1970 at the moment of tap
 }
+
+/// One point event in a collaborative drawing stroke.
+struct StrokeMessage: Codable {
+    let messageType: String  // always "stroke"
+    let event: String        // "begin", "move", "end", "clear"
+    let strokeID: String     // UUID grouping all events in one stroke
+    let x: Float             // normalised 0-1
+    let y: Float             // normalised 0-1
+    let r: Float             // stroke colour components
+    let g: Float
+    let b: Float
+    let lineWidth: Float
+}
+
+// Internal: first-pass decode to route by message type
+private struct MessageTypeProbe: Codable { let messageType: String }
 
 protocol MeshManagerDelegate: AnyObject {
     func meshManager(_ manager: MeshManager, didReceiveNearbyObject object: NINearbyObject, forPeer peerID: MCPeerID)
@@ -18,6 +35,7 @@ protocol MeshManagerDelegate: AnyObject {
     func meshManager(_ manager: MeshManager, didUpdateState state: String)
     func meshManager(_ manager: MeshManager, didEncounterError error: Error)
     func meshManager(_ manager: MeshManager, didReceiveRipple ripple: RippleMessage, fromPeer peerID: MCPeerID)
+    func meshManager(_ manager: MeshManager, didReceiveStroke stroke: StrokeMessage, fromPeer peerID: MCPeerID)
 }
 
 class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceBrowserDelegate, MCSessionDelegate, NISessionDelegate {
@@ -150,16 +168,29 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
     }
 
     func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
-        // Try ripple message first (JSON), then fall back to NIDiscoveryToken (binary).
-        if let ripple = try? JSONDecoder().decode(RippleMessage.self, from: data) {
-            print("[MeshManager] 📡 Received ripple from \(peerID.displayName) — (\(ripple.x), \(ripple.y))  age=\(String(format:"%.3f", Date().timeIntervalSince1970 - ripple.wallTime))s")
-            DispatchQueue.main.async {
-                self.delegate?.meshManager(self, didReceiveRipple: ripple, fromPeer: peerID)
+        // Route JSON messages by messageType; binary data is NIDiscoveryToken.
+        if let probe = try? JSONDecoder().decode(MessageTypeProbe.self, from: data) {
+            switch probe.messageType {
+            case "ripple":
+                if let ripple = try? JSONDecoder().decode(RippleMessage.self, from: data) {
+                    print("[MeshManager] 📡 Ripple from \(peerID.displayName)  age=\(String(format:"%.3f", Date().timeIntervalSince1970 - ripple.wallTime))s")
+                    DispatchQueue.main.async {
+                        self.delegate?.meshManager(self, didReceiveRipple: ripple, fromPeer: peerID)
+                    }
+                }
+            case "stroke":
+                if let stroke = try? JSONDecoder().decode(StrokeMessage.self, from: data) {
+                    DispatchQueue.main.async {
+                        self.delegate?.meshManager(self, didReceiveStroke: stroke, fromPeer: peerID)
+                    }
+                }
+            default:
+                break
             }
             return
         }
 
-        // NIDiscoveryToken exchange
+        // NIDiscoveryToken exchange (binary, not JSON)
         do {
             if let token = try NSKeyedUnarchiver.unarchivedObject(ofClass: NIDiscoveryToken.self, from: data) {
                 peerTokens[peerID] = token
@@ -180,7 +211,7 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
     /// Broadcasts a ripple event to all connected peers.
     func sendRipple(normalizedX: Float, normalizedY: Float) {
         guard !session.connectedPeers.isEmpty else { return }
-        let msg = RippleMessage(x: normalizedX, y: normalizedY,
+        let msg = RippleMessage(messageType: "ripple", x: normalizedX, y: normalizedY,
                                 wallTime: Date().timeIntervalSince1970)
         guard let data = try? JSONEncoder().encode(msg) else { return }
         do {
@@ -189,6 +220,15 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
         } catch {
             delegate?.meshManager(self, didEncounterError: error)
         }
+    }
+
+    /// Broadcasts a stroke event to all connected peers.
+    /// Uses .unreliable for "move" events (low latency, drops OK) and .reliable for begin/end/clear.
+    func sendStroke(_ stroke: StrokeMessage) {
+        guard !session.connectedPeers.isEmpty else { return }
+        guard let data = try? JSONEncoder().encode(stroke) else { return }
+        let reliability: MCSessionSendDataMode = stroke.event == "move" ? .unreliable : .reliable
+        try? session.send(data, toPeers: session.connectedPeers, with: reliability)
     }
 
     func session(_ session: MCSession, didReceive stream: InputStream, withName streamName: String, fromPeer peerID: MCPeerID) {

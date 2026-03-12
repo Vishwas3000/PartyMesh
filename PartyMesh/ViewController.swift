@@ -50,6 +50,11 @@ class ViewController: UIViewController, MeshManagerDelegate {
 
     private var waterRippleView: WaterRippleView?
 
+    // MARK: - Scribble
+
+    private var scribbleView: ScribbleView?
+    private var isDrawing = false
+
     // MARK: - Color Constants
 
     let minDistanceForColorChange: Float = 0.1
@@ -63,6 +68,7 @@ class ViewController: UIViewController, MeshManagerDelegate {
         super.viewDidLoad()
         setupUI()
         setupWaterRipple()
+        setupScribble()
 
         meshManager = MeshManager()
         meshManager.delegate = self
@@ -125,6 +131,70 @@ class ViewController: UIViewController, MeshManagerDelegate {
         tap.cancelsTouchesInView = false  // don't block underlying scroll views
         view.addGestureRecognizer(tap)
         print("[WaterRipple] ✅ Tap gesture added to view")
+    }
+
+    private func setupScribble() {
+        let sv = ScribbleView(frame: view.bounds)
+        sv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(sv)
+        scribbleView = sv
+
+        sv.onStrokeEvent = { [weak self] msg in
+            self?.meshManager.sendStroke(msg)
+        }
+
+        // Draw toggle button — pencil icon, top-right corner
+        let drawBtn = UIButton(type: .system)
+        drawBtn.setImage(UIImage(systemName: "pencil.circle.fill"), for: .normal)
+        drawBtn.tintColor = .white
+        drawBtn.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        drawBtn.layer.cornerRadius = 22
+        drawBtn.translatesAutoresizingMaskIntoConstraints = false
+        drawBtn.addTarget(self, action: #selector(toggleDrawMode(_:)), for: .touchUpInside)
+        drawBtn.tag = 901
+        view.addSubview(drawBtn)
+
+        // Clear button — trash icon, next to draw button, hidden until draw mode
+        let clearBtn = UIButton(type: .system)
+        clearBtn.setImage(UIImage(systemName: "trash.circle.fill"), for: .normal)
+        clearBtn.tintColor = .white
+        clearBtn.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        clearBtn.layer.cornerRadius = 22
+        clearBtn.translatesAutoresizingMaskIntoConstraints = false
+        clearBtn.addTarget(self, action: #selector(clearScribble), for: .touchUpInside)
+        clearBtn.isHidden = true
+        clearBtn.tag = 902
+        view.addSubview(clearBtn)
+
+        NSLayoutConstraint.activate([
+            drawBtn.widthAnchor.constraint(equalToConstant: 44),
+            drawBtn.heightAnchor.constraint(equalToConstant: 44),
+            drawBtn.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            drawBtn.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+
+            clearBtn.widthAnchor.constraint(equalToConstant: 44),
+            clearBtn.heightAnchor.constraint(equalToConstant: 44),
+            clearBtn.centerYAnchor.constraint(equalTo: drawBtn.centerYAnchor),
+            clearBtn.trailingAnchor.constraint(equalTo: drawBtn.leadingAnchor, constant: -8),
+        ])
+    }
+
+    @objc private func toggleDrawMode(_ sender: UIButton) {
+        isDrawing.toggle()
+        scribbleView?.isDrawingEnabled = isDrawing
+
+        let icon = isDrawing ? "checkmark.circle.fill" : "pencil.circle.fill"
+        sender.setImage(UIImage(systemName: icon), for: .normal)
+        sender.tintColor = isDrawing ? .systemGreen : .white
+
+        // Show/hide clear button
+        view.viewWithTag(902)?.isHidden = !isDrawing
+
+        print("[Scribble] Draw mode: \(isDrawing)")
+    }
+
+    @objc private func clearScribble() {
+        scribbleView?.clear()
     }
 
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
@@ -226,6 +296,11 @@ class ViewController: UIViewController, MeshManagerDelegate {
         // Already on main thread (MeshManager dispatches to main before calling delegate)
         let normalizedPoint = CGPoint(x: CGFloat(ripple.x), y: CGFloat(ripple.y))
         waterRippleView?.addRemoteRipple(normalizedPoint: normalizedPoint, wallTime: ripple.wallTime)
+    }
+
+    func meshManager(_ manager: MeshManager, didReceiveStroke stroke: StrokeMessage, fromPeer peerID: MCPeerID) {
+        // Already on main thread
+        scribbleView?.applyRemoteStroke(stroke)
     }
 
     func meshManager(_ manager: MeshManager, didEncounterError error: Error) {

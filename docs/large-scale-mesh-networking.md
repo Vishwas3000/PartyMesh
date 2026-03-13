@@ -258,3 +258,188 @@ Steps 1–6 can be done in a single sprint and immediately scale the app to 50�
 | Topology gossip interval | 5s | Fast enough for routing convergence, slow enough for battery |
 | Seen-message cache TTL | 60s | Longer than any message's network lifetime |
 | Routing table staleness | 30s | Mark node unreachable if no topology update received |
+
+---
+
+## Flow Diagrams
+
+### 1 — Outbound Connection Decision (`browser(_:foundPeer:)`)
+
+Every time Bonjour surfaces a new peer this decision tree runs. It is the core gate
+that keeps the local graph bounded at K=5.
+
+```mermaid
+flowchart TD
+    START([Bonjour: foundPeer]) --> ALREADY{Already connected\nor pending?}
+    ALREADY -->|Yes| SKIP([↩ Skip])
+    ALREADY -->|No| TIEBREAK{Our sessionUUID\n> peer sessionUUID?}
+    TIEBREAK -->|No — lower UUID| WAIT([Wait to receive\ntheir invitation])
+    TIEBREAK -->|Yes — higher UUID\nor no sid in info| SLOTS{connected + pending\n< K = 5?}
+
+    SLOTS -->|No — at capacity| QUEUE[Add to candidatePeers\n📋 queued for next open slot]
+    SLOTS -->|Yes — slot available| LASTSLOT{Filling the\nKth slot?}
+
+    LASTSLOT -->|Yes| RANDOM[Mark as randomSlotPeer\n🎲 exempt from distance eviction]
+    LASTSLOT -->|No| PROX[Normal proximity slot]
+    RANDOM --> INVITE
+    PROX --> INVITE
+
+    INVITE[pendingPeers.insert\nbrowser.invitePeer timeout=10s] --> DONE([Invitation sent])
+```
+
+---
+
+### 2 — Inbound Invitation Gate (`advertiser(_:didReceiveInvitation:)`)
+
+The higher-UUID peer sends the invitation; the lower-UUID peer decides whether to
+accept it. Without this check an aggressive peer could push us over K.
+
+```mermaid
+flowchart TD
+    START([Receive invitation\nfrom higher-UUID peer]) --> CONNECTED{Already\nconnected to them?}
+    CONNECTED -->|Yes| REJECT1([Reject — duplicate])
+    CONNECTED -->|No| CAPACITY{connected + pending\n≥ K = 5?}
+    CAPACITY -->|Yes| REJECT2([Reject — at K capacity])
+    CAPACITY -->|No| ACCEPT([Accept into MCSession])
+```
+
+---
+
+### 3 — Disconnect & Slot Recovery (`session(_:peer:didChange:)` → `connectNextCandidate`)
+
+When any peer disconnects a slot opens. The slot is immediately offered to the
+first waiting candidate so the graph self-heals without any manual intervention.
+
+```mermaid
+flowchart TD
+    START([MCSession: .notConnected]) --> CLEANUP[Remove from\nconnectedPeers · peerTokens · pendingPeers]
+    CLEANUP --> RANDOMCHECK{Was this\nthe randomSlotPeer?}
+    RANDOMCHECK -->|Yes| CLEARRANDOM[randomSlotPeer = nil]
+    RANDOMCHECK -->|No| PROMOTE
+    CLEARRANDOM --> PROMOTE
+
+    PROMOTE[connectNextCandidate] --> HASCANDIDATE{candidatePeers\nnot empty?}
+    HASCANDIDATE -->|No| IDLE([No candidates waiting])
+    HASCANDIDATE -->|Yes| SLOTCHECK{totalActive\n< K = 5?}
+    SLOTCHECK -->|No| FULL([Still at capacity\nwait for another disconnect])
+    SLOTCHECK -->|Yes| CONNECT[Pop first candidate\npendingPeers.insert\nbrowser.invitePeer]
+    CONNECT --> FILLED([Slot filled])
+
+    CLEANUP --> EMPTYCHECK{All peers gone?}
+    EMPTYCHECK -->|Yes| REBUILD[rebuildSession\nrecreate NISession]
+    EMPTYCHECK -->|No| REFRESH[Refresh NISession\nfor remaining peers]
+```
+
+---
+
+### 4 — NI Distance Eviction Signal (`session(_:didUpdate:)`)
+
+NearbyInteraction fires distance updates for every connected peer. This flow
+logs eviction candidates. Actual disconnect requires per-peer MCSession (Build Step 4).
+
+```mermaid
+flowchart TD
+    START([NISession: didUpdate]) --> UPDATESTORE[Update connectedPeers\ndistance + direction]
+    UPDATESTORE --> DELEGATE[Notify delegate\nfor UI update]
+    UPDATESTORE --> DISTKNOWN{Distance\nfield present?}
+    DISTKNOWN -->|No| END([Done])
+    DISTKNOWN -->|Yes| ISRANDOM{peerID ==\nrandomSlotPeer?}
+
+    ISRANDOM -->|Yes| EXEMPT[Log 🎲 random-slot\nexempt from eviction]
+    ISRANDOM -->|No| THRESHOLD{distance >\n4.0 m?}
+
+    THRESHOLD -->|No| INRANGE[Log ✅ within range]
+    THRESHOLD -->|Yes| EVICT[Log ⚠️ eviction candidate\nFuture: disconnect + connectNextCandidate\nRequires per-peer MCSession]
+
+    EXEMPT --> END
+    INRANGE --> END
+    EVICT --> END
+```
+
+---
+
+### 5 — Message Routing: Broadcast vs Unicast
+
+Two completely different forwarding paths depending on whether the message
+targets everyone (`*`) or a specific node.
+
+```mermaid
+flowchart TD
+    SEND([App wants to send message]) --> DTYPE{Destination}
+
+    DTYPE -->|dest = asterisk\nripple · drawing| BWRAP[Wrap in MeshEnvelope\ndest=asterisk · TTL=6 · messageID=UUID]
+    DTYPE -->|dest = nodeID\n1-to-1 DM| UWRAP[Look up routing table\nnextHop = routingTable nodeID]
+
+    BWRAP --> BSEND[Send to all K neighbors]
+    UWRAP --> USEND[Send to nextHop only]
+
+    RECEIVE([Receive MeshEnvelope]) --> CACHE{messageID\nin seenCache?}
+    CACHE -->|Yes| DROP([Drop — already seen])
+    CACHE -->|No| ADDCACHE[seenCache.insert\nmessageID]
+
+    ADDCACHE --> TTL{TTL > 0?}
+    TTL -->|No| DROP2([Drop — TTL expired])
+    TTL -->|Yes| DEST{dest == myNodeID\nor dest == asterisk?}
+
+    DEST -->|Yes — for me| DELIVER([Deliver payload to app])
+    DEST -->|No — transit node| FORWARD[Decrement TTL\nForward to all neighbors\nexcept the peer it arrived from]
+    FORWARD --> DONE([Forwarded])
+```
+
+---
+
+### 6 — Full Topology Lifecycle (Party scenario, 9 devices)
+
+**Critical rule: K=5 is per device, not per network.**
+Every device independently manages its own 5 slots. The network as a whole
+can hold unlimited devices — each one connects to up to 5 neighbours of its own.
+
+```mermaid
+flowchart TD
+    subgraph Phase1 ["Phase 1 — A fills its 5 slots (B C D E F)"]
+        direction LR
+        A1((A\nK=5 ✅)) --- B1((B))
+        A1 --- C1((C))
+        A1 --- D1((D))
+        A1 --- E1((E))
+        A1 --- F1((F 🎲))
+        note1(["B C D E F each have\ntheir own 5 slots too\n— not shown for clarity"])
+    end
+
+    subgraph Phase2 ["Phase 2 — G H I arrive. A is full — they queue for A\nbut connect freely to B C D E F (those have open slots)"]
+        direction LR
+        A2((A\nK=5 full)) -.- G2((G 📋))
+        A2 -.- H2((H 📋))
+        A2 -.- I2((I 📋))
+        B2((B)) --- G2
+        C2((C)) --- H2
+        D2((D)) --- I2
+        note2(["G H I are candidates only for A.\nThey already have live connections\nthrough B C D — they are IN the network."])
+    end
+
+    subgraph Phase3 ["Phase 3 — B disconnects from A\nG promoted into A's open slot\nB rejoins as candidate for A (A is full again)"]
+        direction LR
+        A3((A\nK=5 ✅)) --- C3((C))
+        A3 --- D3((D))
+        A3 --- E3((E))
+        A3 --- F3((F 🎲))
+        A3 --- G3((G ✅\nwas 📋))
+        B3((B 📋\nfor A)) -.- A3
+        B3 --- H3((H))
+        B3 --- I3((I))
+        note3(["B is not isolated — it still has\nconnections to H I and others.\nIt is only a candidate for A's slot."])
+    end
+
+    Phase1 --> Phase2 --> Phase3
+```
+
+**Key takeaways:**
+
+| Question | Answer |
+|---|---|
+| How does B reconnect to A? | B becomes a `📋` candidate for A. When the next slot opens (someone else leaves), `connectNextCandidate` promotes B. |
+| How do H and I join the network? | They connect directly to B, C, D, E, or F (those devices have open slots). They don't need A's slot at all. |
+| Is H or I isolated while waiting for A's slot? | No. Being a candidate for A just means "not yet connected to A". H and I already have live paths through other peers. |
+| What is the total network capacity? | Unlimited. Each new device needs only one open slot anywhere in the graph to join. The K=5 cap keeps the graph *sparse*, not *small*. |
+
+`📋` = candidate for that specific device's slot  ·  `🎲` = random long-range slot (eviction-exempt)  ·  `✅` = active connection

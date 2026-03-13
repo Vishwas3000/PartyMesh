@@ -58,6 +58,23 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
     /// Peers we've invited but that haven't reached .connected yet.
     private var pendingPeers: Set<MCPeerID> = []
 
+    // MARK: - K-Neighbor topology
+
+    /// Maximum simultaneous MCSession connections.
+    /// Apple's MCSession hard-limit is 8; we cap at 5 to leave headroom and
+    /// to keep the local graph sparse (4 proximity neighbours + 1 random long-range).
+    private let maxNeighbors = 5
+
+    /// Peers discovered via Bonjour but not connected because we were at maxNeighbors.
+    /// Keyed by MCPeerID; value is the peer's sessionUUID (already passed the tiebreaker,
+    /// so we can invite them directly when a slot opens).
+    private var candidatePeers: [MCPeerID: String] = [:]
+
+    /// The MCPeerID occupying the "random long-range" slot — the last peer to connect
+    /// when we hit maxNeighbors. This peer is exempt from distance-based eviction so
+    /// the graph always has at least one non-proximity link, reducing partition risk.
+    private var randomSlotPeer: MCPeerID?
+
     var niSession: NISession?
     var peerTokens: [MCPeerID: NIDiscoveryToken] = [:]
     var connectedPeers: [MCPeerID: NINearbyObject] = [:]
@@ -80,6 +97,8 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
         session.disconnect()
         buildSession()
         pendingPeers.removeAll()
+        candidatePeers.removeAll()
+        randomSlotPeer = nil
         print("[MeshManager] 🔄 Session rebuilt — ready for fresh connections")
     }
 
@@ -112,6 +131,8 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
         niSession?.invalidate()
         niSession = nil
         pendingPeers.removeAll()
+        candidatePeers.removeAll()
+        randomSlotPeer = nil
         delegate?.meshManager(self, didUpdateState: "Stopped.")
     }
 
@@ -131,10 +152,12 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
                     didReceiveInvitationFromPeer peerID: MCPeerID,
                     withContext context: Data?,
                     invitationHandler: @escaping (Bool, MCSession?) -> Void) {
-        // Reject if already connected to avoid duplicate sessions.
         let alreadyConnected = session.connectedPeers.contains(peerID)
-        print("[MeshManager] 📨 Invitation from \(peerID.displayName) — \(alreadyConnected ? "rejected (already connected)" : "accepted")")
-        invitationHandler(!alreadyConnected, alreadyConnected ? nil : session)
+        let atCapacity = session.connectedPeers.count + pendingPeers.count >= maxNeighbors
+        let accept = !alreadyConnected && !atCapacity
+        let reason = alreadyConnected ? "already connected" : atCapacity ? "at K=\(maxNeighbors) capacity" : "accepted"
+        print("[MeshManager] 📨 Invitation from \(peerID.displayName) — \(reason)")
+        invitationHandler(accept, accept ? session : nil)
     }
 
     func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {
@@ -166,14 +189,31 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
             }
         }
 
+        let totalActive = session.connectedPeers.count + pendingPeers.count
+        guard totalActive < maxNeighbors else {
+            // At K-neighbor capacity. Park this peer as a candidate: when any current
+            // neighbor disconnects or is evicted, connectNextCandidate() will pick it up.
+            candidatePeers[peerID] = info?["sid"] ?? ""
+            print("[MeshManager] 📋 At K=\(maxNeighbors) — \(peerID.displayName) queued as candidate (\(candidatePeers.count) waiting)")
+            return
+        }
+
+        // If this fills the last slot, mark it as the random long-range peer.
+        // All earlier slots are considered proximity peers (connected in discovery order).
+        if totalActive == maxNeighbors - 1 {
+            randomSlotPeer = peerID
+            print("[MeshManager] 🎲 \(peerID.displayName) assigned to random long-range slot")
+        }
+
         pendingPeers.insert(peerID)
-        print("[MeshManager] 🔍 Found \(peerID.displayName) — inviting… (our UUID wins)")
+        print("[MeshManager] 🔍 Found \(peerID.displayName) — inviting… (\(totalActive + 1)/\(maxNeighbors) slots)")
         browser.invitePeer(peerID, to: session, withContext: nil, timeout: 10)
     }
 
     func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
         // Only remove from pending; actual cleanup happens in session state .notConnected.
         pendingPeers.remove(peerID)
+        candidatePeers.removeValue(forKey: peerID)
         print("[MeshManager] 🔍 Lost sight of \(peerID.displayName)")
     }
 
@@ -212,10 +252,15 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
             pendingPeers.remove(peerID)
             peerTokens.removeValue(forKey: peerID)
             connectedPeers.removeValue(forKey: peerID)
+            if randomSlotPeer == peerID { randomSlotPeer = nil }
             print("[MeshManager] ❌ Disconnected: \(peerID.displayName)  remaining=\(session.connectedPeers.count)")
 
             delegate?.meshManager(self, disconnectedPeer: peerID)
             delegate?.meshManager(self, didUpdateState: "Disconnected from \(peerID.displayName)")
+
+            // A slot just opened — promote a waiting candidate before deciding
+            // whether to rebuild. This fills the vacancy without a full teardown.
+            connectNextCandidate()
 
             if session.connectedPeers.isEmpty {
                 // Rebuild MCSession so the next peer gets a clean slate.
@@ -328,6 +373,42 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
         // Not used for this POC
     }
 
+    // MARK: - K-Neighbor helpers
+
+    /// Invites the first available candidate peer when a connection slot has opened.
+    /// Called from .notConnected so the vacancy is filled as soon as possible.
+    private func connectNextCandidate() {
+        guard let browser else { return }
+        let totalActive = session.connectedPeers.count + pendingPeers.count
+        guard totalActive < maxNeighbors else { return }
+
+        // Pick the first candidate that hasn't gone stale (still visible via Bonjour).
+        // candidatePeers is ordered by insertion (Swift Dict is unordered, but for
+        // small N this is fine — future work can sort by distance once NI gossip lands).
+        guard let (candidateID, _) = candidatePeers.first else {
+            print("[MeshManager] 📋 No candidates in queue")
+            return
+        }
+
+        candidatePeers.removeValue(forKey: candidateID)
+        pendingPeers.insert(candidateID)
+        browser.invitePeer(candidateID, to: session, withContext: nil, timeout: 10)
+        print("[MeshManager] 📋 Slot opened — promoting candidate \(candidateID.displayName) (\(candidatePeers.count) remaining)")
+    }
+
+    /// Returns the connected peer with the highest NI distance, excluding the random-slot peer.
+    /// Used to identify the best eviction candidate once per-peer MCSession is in place.
+    /// Currently informational only — MCSession doesn't support per-peer disconnect.
+    private func farthestProximityPeer() -> (MCPeerID, Float)? {
+        connectedPeers
+            .filter { $0.key != randomSlotPeer }
+            .compactMap { (pid, obj) -> (MCPeerID, Float)? in
+                guard let dist = obj.distance else { return nil }
+                return (pid, dist)
+            }
+            .max(by: { $0.1 < $1.1 })
+    }
+
     // MARK: - NearbyInteraction
 
     /// Sends our NIDiscoveryToken to `peerID`.
@@ -362,6 +443,12 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
         }
     }
 
+    /// Evict threshold: disconnect a proximity peer when it drifts beyond this distance.
+    /// The random-slot peer is exempt. Actual disconnect requires per-peer MCSession
+    /// (tracked in docs/large-scale-mesh-networking.md — build step 4). For now this
+    /// logs the signal so the threshold can be tuned before the architecture upgrade.
+    private let evictDistanceThreshold: Float = 4.0  // metres
+
     func session(_ session: NISession, didUpdate nearbyObjects: [NINearbyObject]) {
         for object in nearbyObjects {
             // Find the MCPeerID associated with this NIDiscoveryToken
@@ -370,6 +457,17 @@ class MeshManager: NSObject, MCNearbyServiceAdvertiserDelegate, MCNearbyServiceB
             }
             connectedPeers[peerID] = object
             delegate?.meshManager(self, didReceiveNearbyObject: object, forPeer: peerID)
+
+            // Distance-based eviction signal.
+            // TODO: replace log with actual disconnect once per-peer MCSession lands.
+            if let dist = object.distance {
+                let slot = peerID == randomSlotPeer ? " [random-slot, exempt]" : ""
+                print("[MeshManager] 📏 \(peerID.displayName): \(String(format: "%.2f", dist))m\(slot)")
+
+                if dist > evictDistanceThreshold, peerID != randomSlotPeer {
+                    print("[MeshManager] ⚠️ \(peerID.displayName) at \(String(format: "%.1f", dist))m > threshold — eviction candidate (needs per-peer MCSession)")
+                }
+            }
         }
     }
 

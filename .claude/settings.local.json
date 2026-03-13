@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/sudeepsharma/Documents/GitHub/PartyMesh -type d -name \".git\" -prune -o -type f -print | grep -E \"README|CONTRIBUTING|LICENSE|\\\\.md$\" | head -10)"
+    ]
+  }
+}
